@@ -244,6 +244,7 @@ impl From<PessimisticLockRequest> for TypedCommand<StorageResult<PessimisticLock
             req.get_check_existence(),
             req.get_lock_only_if_exists(),
             allow_lock_with_conflict,
+            req.get_skip_locked(),
             req.take_context(),
         )
     }
@@ -1139,6 +1140,7 @@ pub mod test_util {
             None,
             return_values,
             TimeStamp::zero(),
+            false,
             false,
             false,
             false,

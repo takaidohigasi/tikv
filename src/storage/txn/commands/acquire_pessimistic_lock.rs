@@ -54,6 +54,11 @@ command! {
             check_existence: bool,
             lock_only_if_exists: bool,
             allow_lock_with_conflict: bool,
+            /// If set, keys locked by other transactions are skipped instead of waited for
+            /// or reported as errors: no lock is written for them and each is reported as
+            /// `PessimisticLockKeyResult::Skipped`. Implements `SELECT ... FOR UPDATE SKIP
+            /// LOCKED`. Incompatible with `allow_lock_with_conflict`.
+            skip_locked: bool,
         }
         in_heap => {
             primary,
@@ -84,6 +89,14 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
             // Currently multiple keys with `allow_lock_with_conflict` set is not supported.
             return Err(Error::from(ErrorInner::Other(box_err!(
                 "multiple keys in a single request with allowed_lock_with_conflict set is not allowed"
+            ))));
+        }
+        if self.skip_locked && self.allow_lock_with_conflict {
+            // `skip_locked` skips keys locked by other transactions while
+            // `allow_lock_with_conflict` forces locking through write conflicts; combining
+            // them is not defined.
+            return Err(Error::from(ErrorInner::Other(box_err!(
+                "skip_locked together with allow_lock_with_conflict is not allowed"
             ))));
         }
 
@@ -123,6 +136,13 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
                     insert_old_value_if_resolved(&mut old_values, k, txn.start_ts, old_value, None);
                 }
                 Err(MvccError(box MvccErrorInner::KeyIsLocked(lock_info))) => {
+                    if self.skip_locked {
+                        // The key is locked by another transaction: skip it and keep locking
+                        // the remaining keys. Previously succeeded keys stay locked, and the
+                        // key never enters the lock waiting queue.
+                        res.push(PessimisticLockKeyResult::Skipped);
+                        continue;
+                    }
                     let request_parameters = PessimisticLockParameters {
                         pb_ctx: ctx.clone(),
                         primary: self.primary.clone(),
@@ -152,6 +172,13 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
                     break;
                 }
                 Err(MvccError(box MvccErrorInner::NotInShrinkMode(mut shared_locks))) => {
+                    if self.skip_locked {
+                        // The key is share-locked by other transactions: skip it without
+                        // converting the shared locks to shrink-only, since a skip-locked
+                        // reader must not mutate other transactions' lock state.
+                        res.push(PessimisticLockKeyResult::Skipped);
+                        continue;
+                    }
                     // Clear previous mutations, mark `shared_locks` as shrink-only and write it
                     // back.
                     let locked_raw_key = k.to_raw()?;
@@ -275,6 +302,7 @@ mod tests {
                     },
                 ) => v1 == v2 && ts1 == ts2,
                 (Self::Waiting, Self::Waiting) => true,
+                (Self::Skipped, Self::Skipped) => true,
                 (Self::Failed(a), Self::Failed(b)) => format!("{:?}", a) == format!("{:?}", b),
                 _ => false,
             }
@@ -495,6 +523,262 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_skip_locked() {
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let mut statistics = Statistics::default();
+
+        let (k1, k2, k3) = (b"k1", b"k2", b"k3");
+        must_prewrite_put(&mut engine, k1, b"v1", k1, 1);
+        must_commit(&mut engine, k1, 1, 2);
+
+        // txn1 locks k2.
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![k2],
+            k2,
+            10,
+            10,
+            false,
+            false,
+        )
+        .unwrap();
+        res.0[0].assert_empty();
+        must_pessimistic_locked(&mut engine, k2, 10, 10);
+
+        // txn2 locks [k1, k2, k3] with skip-locked: k2 is skipped while k1 and k3 are
+        // still locked, unlike the wait/nowait behaviors which abandon the whole
+        // request.
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![k1, k2, k3],
+            k1,
+            20,
+            20,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(res.0.len(), 3);
+        res.0[0].assert_empty();
+        res.0[1].assert_skipped();
+        res.0[2].assert_empty();
+        must_pessimistic_locked(&mut engine, k1, 20, 20);
+        must_pessimistic_locked(&mut engine, k3, 20, 20);
+        // k2 is still locked by txn1.
+        must_pessimistic_locked(&mut engine, k2, 10, 10);
+
+        // Keys locked by the same transaction are not skipped.
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![k2],
+            k2,
+            10,
+            10,
+            false,
+            false,
+        )
+        .unwrap();
+        res.0[0].assert_empty();
+
+        // With return_values, no value is returned for a skipped key.
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![k1, k2],
+            k1,
+            20,
+            20,
+            true,
+            false,
+        )
+        .unwrap();
+        res.0[0].assert_value(Some(b"v1"));
+        res.0[1].assert_skipped();
+
+        // Optimistic (prewrite) locks of other transactions are skipped as well.
+        must_prewrite_put(&mut engine, b"k4", b"v4", b"k4", 15);
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![b"k4"],
+            b"k4",
+            20,
+            20,
+            false,
+            false,
+        )
+        .unwrap();
+        res.0[0].assert_skipped();
+
+        // A write conflict on an unlocked key is not a lock and still fails the
+        // request: the client is expected to retry at a newer for_update_ts.
+        must_prewrite_put(&mut engine, b"k5", b"v5", b"k5", 25);
+        must_commit(&mut engine, b"k5", 25, 30);
+        let err = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![b"k5"],
+            b"k5",
+            20,
+            20,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error(box ErrorInner::Mvcc(MvccError(box MvccErrorInner::WriteConflict { .. })))
+        ));
+
+        // skip_locked together with allow_lock_with_conflict is rejected.
+        let err = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![b"k6"],
+            b"k6",
+            20,
+            20,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error(box ErrorInner::Other(_))));
+
+        // Per-key results are reported in request order even when the keys are not
+        // sorted: txn at ts 30 locks k8, and a skip-locked request for [k9, k7, k8]
+        // must report [Normal, Normal, Skipped].
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![b"k8"],
+            b"k8",
+            30,
+            30,
+            false,
+            false,
+        )
+        .unwrap();
+        res.0[0].assert_empty();
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![b"k9", b"k7", b"k8"],
+            b"k9",
+            40,
+            40,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(res.0.len(), 3);
+        res.0[0].assert_empty();
+        res.0[1].assert_empty();
+        res.0[2].assert_skipped();
+        must_pessimistic_locked(&mut engine, b"k9", 40, 40);
+        must_pessimistic_locked(&mut engine, b"k7", 40, 40);
+        must_pessimistic_locked(&mut engine, b"k8", 30, 30);
+    }
+
+    #[test]
+    fn test_skip_locked_shared_locks() {
+        let mut engine = TestEngineBuilder::new().build().unwrap();
+        let mut statistics = Statistics::default();
+        let pk = b"pk";
+        let key = b"shared";
+        let ctx = kvrpcpb::Context::default();
+
+        // txn1 acquires a shared lock on the key.
+        let res = must_process_acquire_pessimistic_cmd(
+            &mut engine,
+            &mut statistics,
+            ctx.clone(),
+            5,
+            5,
+            pk,
+            key,
+            true,
+        );
+        engine.write(&ctx, res.to_be_write).unwrap();
+
+        // An exclusive skip-locked request skips the key without converting the shared
+        // locks to shrink-only, since a skip-locked reader must not mutate other
+        // transactions' lock state.
+        let res = acquire_skip_locked(
+            &mut engine,
+            &mut statistics,
+            vec![key],
+            pk,
+            10,
+            10,
+            false,
+            false,
+        )
+        .unwrap();
+        res.0[0].assert_skipped();
+        let shared_locks = must_load_shared_lock(&mut engine, key);
+        assert!(!shared_locks.is_shrink_only());
+    }
+
+    /// Processes an `AcquirePessimisticLock` command with `skip_locked` set,
+    /// asserting that no key enters the lock waiting queue, and applies its
+    /// writes to the engine.
+    fn acquire_skip_locked<E: Engine>(
+        engine: &mut E,
+        statistics: &mut Statistics,
+        keys: Vec<&[u8]>,
+        pk: &[u8],
+        start_ts: u64,
+        for_update_ts: u64,
+        return_values: bool,
+        allow_lock_with_conflict: bool,
+    ) -> Result<PessimisticLockResults> {
+        let ctx = kvrpcpb::Context::default();
+        let snap = engine.snapshot(Default::default()).unwrap();
+        let concurrency_manager = ConcurrencyManager::new_for_test(start_ts.into());
+        let cmd = AcquirePessimisticLock::new(
+            keys.into_iter()
+                .map(|k| (Key::from_raw(k), false, false))
+                .collect(),
+            pk.to_vec(),
+            start_ts.into(),
+            3000,
+            false,
+            for_update_ts.into(),
+            Some(WaitTimeout::Default),
+            return_values,
+            TimeStamp::zero(),
+            false,
+            false,
+            allow_lock_with_conflict,
+            true,
+            ctx.clone(),
+        );
+        let context = WriteContext {
+            lock_mgr: &MockLockManager::new(),
+            concurrency_manager,
+            extra_op: ExtraOp::Noop,
+            statistics,
+            async_apply_prewrite: false,
+            raw_ext: None,
+            txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+        };
+        let res = cmd.cmd.process_write(snap, context)?;
+        // Skipped keys never enter the lock waiting queue, even though a wait timeout
+        // is set on the request.
+        assert!(res.lock_info.is_empty());
+        if !res.to_be_write.modifies.is_empty() {
+            engine.write(&ctx, res.to_be_write).unwrap();
+        }
+        match res.pr {
+            ProcessResult::PessimisticLockRes { res } => Ok(res.unwrap()),
+            _ => unreachable!(),
+        }
+    }
+
     fn must_process_acquire_pessimistic_cmd<E: Engine>(
         engine: &mut E,
         statistics: &mut Statistics,
@@ -517,6 +801,7 @@ mod tests {
             Some(WaitTimeout::Default),
             false,
             TimeStamp::zero(),
+            false,
             false,
             false,
             false,

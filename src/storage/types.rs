@@ -202,6 +202,10 @@ pub enum PessimisticLockKeyResult {
     },
     /// The key is already locked and lock-waiting is needed.
     Waiting,
+    /// The key is locked by another transaction and was skipped without being
+    /// locked or waited for. Only produced when `skip_locked` is set in the
+    /// request.
+    Skipped,
     /// Failed to acquire the lock due to some error.
     Failed(SharedError),
 }
@@ -299,6 +303,11 @@ impl PessimisticLockKeyResult {
         assert!(matches!(self, Self::Waiting));
     }
 
+    #[cfg(test)]
+    pub fn assert_skipped(&self) {
+        assert!(matches!(self, Self::Skipped));
+    }
+
     pub fn unwrap_err(&self) -> SharedError {
         match self {
             Self::Failed(e) => e.clone(),
@@ -355,6 +364,9 @@ impl PessimisticLockResults {
                         res_pb.set_locked_with_conflict_ts(conflict_ts.into_inner());
                     }
                     PessimisticLockKeyResult::Waiting => unreachable!(),
+                    PessimisticLockKeyResult::Skipped => {
+                        res_pb.set_type(kvrpcpb::PessimisticLockKeyResultType::LockResultSkipped)
+                    }
                     PessimisticLockKeyResult::Failed(e) => {
                         if error.is_none() {
                             error = Some(e)
@@ -421,7 +433,10 @@ impl PessimisticLockResults {
                         10 + value.as_ref().map_or(0, |v| v.len() as u64) // 10 stands for type + bool + conflict_ts
                     }
                     PessimisticLockKeyResult::Waiting => {
-                        1 // for test only 
+                        1 // for test only
+                    }
+                    PessimisticLockKeyResult::Skipped => {
+                        1 // type
                     }
                     PessimisticLockKeyResult::Failed(_) => {
                         1 // type, ignoring error message

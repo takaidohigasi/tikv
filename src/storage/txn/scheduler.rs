@@ -2559,6 +2559,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 Context::default(),
             )
             .into(),

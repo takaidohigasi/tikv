@@ -2471,28 +2471,27 @@ txn_command_future!(future_prewrite, PrewriteRequest, PrewriteResponse, (v, resp
 });
 txn_command_future!(future_acquire_pessimistic_lock, PessimisticLockRequest, PessimisticLockResponse,
     (req) {
-        let mode = req.get_wake_up_mode()
+        let (mode, skip_locked) = (req.get_wake_up_mode(), req.get_skip_locked())
     };
     (v, resp, tracker) {{
         match v {
             Ok(Ok(res)) => {
-                match mode {
-                    PessimisticLockWakeUpMode::WakeUpModeForceLock => {
-                        let (res, error) = res.into_pb();
-                        resp.set_results(res.into());
-                        if let Some(e) = error {
-                            if let Some(region_error) = extract_region_error_from_error(&e.0) {
-                                resp.set_region_error(region_error);
-                            } else {
-                                resp.set_errors(vec![extract_key_error(&e.0)].into());
-                            }
+                // Skip-locked requests report per-key results (including skipped keys) in
+                // the `results` field even though they use `WakeUpModeNormal`.
+                if mode == PessimisticLockWakeUpMode::WakeUpModeForceLock || skip_locked {
+                    let (res, error) = res.into_pb();
+                    resp.set_results(res.into());
+                    if let Some(e) = error {
+                        if let Some(region_error) = extract_region_error_from_error(&e.0) {
+                            resp.set_region_error(region_error);
+                        } else {
+                            resp.set_errors(vec![extract_key_error(&e.0)].into());
                         }
                     }
-                    PessimisticLockWakeUpMode::WakeUpModeNormal => {
-                        let (values, not_founds) = res.into_legacy_values_and_not_founds();
-                        resp.set_values(values.into());
-                        resp.set_not_founds(not_founds);
-                    }
+                } else {
+                    let (values, not_founds) = res.into_legacy_values_and_not_founds();
+                    resp.set_values(values.into());
+                    resp.set_not_founds(not_founds);
                 }
             },
             Err(e) | Ok(Err(e)) => {
